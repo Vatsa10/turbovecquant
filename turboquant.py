@@ -105,29 +105,48 @@ class TurboQuantIndex:
         self._packed_codes = packed_codes
         self._norms = norms
 
-    @classmethod
-    def from_vectors(cls, vectors, bit_width=3):
+    def _encode(self, vectors):
         vectors = np.asarray(vectors, dtype=np.float32)
-        n, dim = vectors.shape
 
         # 1. Extract norms and normalize to unit vectors on the hypersphere
         norms = np.linalg.norm(vectors, axis=-1).astype(np.float32)
         unit_vectors = vectors / np.maximum(norms, 1e-10)[..., None]
 
         # 2. Rotate so each coordinate follows a known distribution
-        Q = make_rotation_matrix(dim)
+        Q = make_rotation_matrix(self.dim)
         rotated = unit_vectors @ Q.T
 
         # 3. Quantize each coordinate to a small integer bucket
-        boundaries, _ = Codebook(bit_width).scaled(dim)
+        boundaries, _ = self.codebook.scaled(self.dim)
         codes = np.searchsorted(boundaries, rotated).astype(np.uint8)
 
         # 4. Bit-pack the bucket indices for storage
-        packed = pack_codes(codes, bit_width)
+        packed = pack_codes(codes, self.bit_width)
 
-        return cls(
-            dim=dim, bit_width=bit_width, n_vectors=n, packed_codes=packed, norms=norms
-        )
+        return packed, norms
+
+    @classmethod
+    def from_vectors(cls, vectors, bit_width=3):
+        vectors = np.asarray(vectors, dtype=np.float32)
+        n, dim = vectors.shape
+        index = cls(dim=dim, bit_width=bit_width, n_vectors=0,
+                    packed_codes=np.empty((0, 0), dtype=np.uint8),
+                    norms=np.empty(0, dtype=np.float32))
+        index.add_vectors(vectors)
+        return index
+
+    def add_vectors(self, vectors):
+        vectors = np.asarray(vectors, dtype=np.float32)
+        packed, norms = self._encode(vectors)
+
+        if self.n_vectors == 0:
+            self._packed_codes = packed
+            self._norms = norms
+        else:
+            self._packed_codes = np.concatenate([self._packed_codes, packed], axis=0)
+            self._norms = np.concatenate([self._norms, norms])
+
+        self.n_vectors += len(vectors)
 
     def search(self, queries, k=10):
         queries = np.asarray(queries, dtype=np.float32)
