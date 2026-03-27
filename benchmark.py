@@ -148,6 +148,40 @@ def run_benchmark(database, queries, bit_widths, label=""):
     print(f"  {'Search':>7}  " + "  ".join(f"{results[bw]['search_time'] / n_queries * 1000:>5.1f}ms/q" for bw in bit_widths))
 
 
+def run_add_vectors_benchmark(database, bit_widths, label=""):
+    n, dim = database.shape
+    print(f"\nadd_vectors benchmark ({label})")
+
+    for bw in bit_widths:
+        # Build index from first 99K
+        index = TurboQuantIndex.from_vectors(database[:n - 100], bit_width=bw)
+
+        # Add 1 vector
+        v = database[n - 1:n]
+        t0 = time.time()
+        index.add_vectors(v)
+        time_1 = time.time() - t0
+
+        # Fresh index, then add 100 vectors one at a time
+        index = TurboQuantIndex.from_vectors(database[:n - 100], bit_width=bw)
+        t0 = time.time()
+        for i in range(100):
+            index.add_vectors(database[n - 100 + i : n - 100 + i + 1])
+        time_100 = time.time() - t0
+
+        # Verify correctness: same results as building all at once
+        index_full = TurboQuantIndex.from_vectors(database, bit_width=bw)
+        q = database[:1]  # use first vector as query
+        _, i_inc = index.search(q, k=5)
+        _, i_full = index_full.search(q, k=5)
+        correct = np.array_equal(i_inc, i_full)
+
+        print(f"  {bw}-bit: add 1 vector = {time_1*1000:.2f}ms, "
+              f"add 100 vectors (1 at a time) = {time_100*1000:.0f}ms "
+              f"({time_100/100*1000:.2f}ms/vec), "
+              f"correct={correct}")
+
+
 DATASETS = {
     "glove": ("GloVe d=200 (100K vectors, 10K queries)", load_glove),
     "openai-1536": ("OpenAI DBpedia d=1536 (100K vectors, 1K queries)", lambda: load_openai(1536)),
@@ -187,5 +221,6 @@ if __name__ == "__main__":
         print(f"Original size: {n * dim * 4 / 1024 / 1024:.1f} MB (FP32)")
 
         run_benchmark(database, queries, [2, 4], name)
+        run_add_vectors_benchmark(database, [2, 4], name)
 
     print("\nDone.")
