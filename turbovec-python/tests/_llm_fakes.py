@@ -42,13 +42,35 @@ class FakeLLM:
     calls: int = 0
     tokens_in: int = 10
     tokens_out: int = 20
+    model: str = "gpt-4o-mini"
+    fail_times: int = 0
 
     def complete(self, messages, **_):
         self.calls += 1
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise RuntimeError("upstream kaboom")
         last = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
         return CompletionResult(
             text=f"{self.reply}:{last}",
             tokens_in=self.tokens_in,
             tokens_out=self.tokens_out,
-            model="fake",
+            model=self.model,
         )
+
+    async def acomplete(self, messages, **kw):
+        return self.complete(messages, **kw)
+
+    def stream(self, messages, **_):
+        self.calls += 1
+        last = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        text = f"{self.reply}:{last}"
+        for i in range(0, len(text), 3):
+            yield text[i:i + 3]
+
+    async def astream(self, messages, **kw):
+        self.calls += 1
+        last = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        text = f"{self.reply}:{last}"
+        for i in range(0, len(text), 3):
+            yield text[i:i + 3]

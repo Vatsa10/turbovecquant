@@ -138,6 +138,105 @@ recent = mem.history("user:42", last_n=20)
 relevant = mem.recall("user:42", query="earlier, we discussed auth — what did I decide?", k=5)
 ```
 
+### Production features
+
+**Streaming** with cache-on-completion:
+
+```python
+for chunk in cache.stream_complete(messages):
+    print(chunk, end="", flush=True)    # first call streams from upstream & caches
+# second call with the same prompt streams from the cache — zero upstream latency
+```
+
+**Gating** — non-deterministic calls bypass the cache automatically. `temperature > 0`, `tools=[...]`, `tool_calls` in messages all route to upstream without polluting the cache. Override with `force_cache=True`.
+
+**Tenant scoping & invalidation**:
+
+```python
+cache.complete(messages, tenant="org:acme")     # scoped to acme
+cache.invalidate(tenant="org:acme")             # blow away one tenant
+cache.invalidate(older_than_seconds=86400)      # anything older than a day
+```
+
+**$-saved tracking** via a built-in price table for OpenAI / Anthropic / Gemini:
+
+```python
+cache.stats()
+# {'hits': 42, 'misses': 8, 'hit_rate': 0.84,
+#  'tokens_saved': 128_400, 'dollars_saved': 0.3137, ...}
+```
+
+**PII redaction** on both cache-key text and cached response text (override with your own `redactor=...` or pass `None` to disable):
+
+```python
+SemanticCache(..., redactor=my_presidio_redactor)
+```
+
+**Negative caching** absorbs retry storms when the upstream is flaky:
+
+```python
+SemanticCache(..., negative_cache_seconds=30)
+```
+
+**Retries** with exponential backoff + jitter are built into every LLM adapter (`retries=3` default). 429/5xx/timeouts are retried; 4xx non-retryable errors fail fast.
+
+**Observability** — pass a `Metrics()` facade for Prometheus counters/histograms (requests, hits, misses, errors, latency, tokens_saved, dollars_saved) and an `AuditLogger()` for one structured JSON line per request:
+
+```python
+from turbovec.llm import Metrics, AuditLogger
+cache = SemanticCache(..., metrics=Metrics(), audit=AuditLogger())
+```
+
+**Eviction** — LFU + TTL helpers for size-capped caches:
+
+```python
+from turbovec.llm.eviction import lfu_evict, ttl_evict
+lfu_evict(cache.store, max_entries=100_000)     # drop coldest entries
+ttl_evict(cache.store, max_age_seconds=7*86400) # drop entries older than a week
+cache.compact()                                  # rebuild index after mass eviction
+```
+
+### OpenAI-compatible proxy server
+
+Drop-in replacement for the OpenAI endpoint so existing SDKs get caching with zero code changes:
+
+```bash
+pip install "turbovec[llm-proxy,llm-openai,llm-metrics]"
+```
+
+```python
+# serve.py
+import uvicorn
+from turbovec.llm import SemanticCache, Metrics
+from turbovec.llm.embedders import OpenAIEmbedder
+from turbovec.llm.llm import OpenAIChat
+from turbovec.llm.proxy import build_app
+
+cache = SemanticCache(
+    embedder=OpenAIEmbedder(),
+    llm=OpenAIChat(model="gpt-4o-mini"),
+    metrics=Metrics(),
+)
+app = build_app(cache)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+Then from any OpenAI client:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="tv-anything")
+client.chat.completions.create(model="gpt-4o-mini", messages=[...])  # now cached
+```
+
+Routes: `POST /v1/chat/completions` (streaming + non-streaming), `GET /v1/models`, `GET /stats`, `GET /metrics` (Prometheus), `POST /admin/invalidate`. The `Authorization: Bearer <key>` header is hashed into a per-key tenant id, so different API keys don't share cache entries.
+
+### Roadmap
+
+The Rust side implements TurboQuant's MSE-optimal half (Lloyd-Max after random rotation). The paper's second stage — a **1-bit QJL residual** for unbiased inner-product estimation at the same bit budget — is not yet ported; this would improve recall at 2-bit without changing the packing layout.
+
 ## Rust
 
 ```bash

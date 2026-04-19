@@ -56,6 +56,8 @@ llm-cohere = ["cohere>=5.0"]
 llm-voyage = ["voyageai>=0.2"]
 llm-local = ["sentence-transformers>=2.2"]
 llm-redis = ["redis>=5.0"]
+llm-proxy = ["fastapi>=0.110", "uvicorn>=0.27"]
+llm-metrics = ["prometheus_client>=0.20"]
 
 [tool.maturin]
 manifest-path = "Cargo.toml"
