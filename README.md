@@ -78,6 +78,66 @@ index = VectorStoreIndex.from_documents(documents, storage_context=storage_conte
 retriever = index.as_retriever(similarity_top_k=5)
 ```
 
+## LLM APIs (client-side cache + RAG compression)
+
+`turbovec.llm` wraps the quantized index into two things you can put in front of a hosted LLM (OpenAI, Anthropic, Gemini, OpenRouter, ...) to cut calls and tokens — **no provider cooperation required**. The transformer KV cache stays on the provider's GPUs; what you compress here is the *client-side* surface: repeated prompts and retrieved RAG context.
+
+```bash
+pip install "turbovec[llm,llm-openai]"          # or llm-anthropic / llm-gemini / llm-local ...
+pip install "turbovec[llm-redis]"               # optional: Redis-backed payload + memory
+```
+
+### Semantic response cache
+
+```python
+from turbovec.llm import SemanticCache
+from turbovec.llm.embedders import OpenAIEmbedder
+from turbovec.llm.llm import OpenAIChat
+from turbovec.llm.stores import RedisStore
+
+cache = SemanticCache(
+    embedder=OpenAIEmbedder(model="text-embedding-3-small"),
+    llm=OpenAIChat(model="gpt-4o-mini"),
+    similarity_threshold=0.93,
+    store=RedisStore(url="redis://localhost:6379/0", ttl_seconds=86400),
+)
+
+reply = cache.complete(messages=[{"role": "user", "content": "capital of france?"}])
+print(reply.text, cache.stats())  # {'hits': 0, 'misses': 1, ...}
+
+# Near-duplicate query reuses the cached completion — no upstream API call.
+cache.complete(messages=[{"role": "user", "content": "what's france's capital"}])
+```
+
+Store backends: `InMemoryStore` (dev), `PickleStore(path)` (single-process disk), `RedisStore(url, ttl_seconds=...)` (shared, with TTL + LRU). System prompts are fingerprinted so two personas can share one cache safely.
+
+### RAG context compressor
+
+```python
+from turbovec.llm import RAGCompressor
+from turbovec.llm.embedders import SentenceTransformerEmbedder
+
+rag = RAGCompressor(embedder=SentenceTransformerEmbedder("BAAI/bge-small-en-v1.5"))
+rag.add_documents(open("corpus.txt").read().split("\n\n"))
+context = rag.compress(query="what do we know about X?", token_budget=2000)
+# feed `context` into your LLM prompt
+```
+
+### Conversation memory
+
+```python
+from turbovec.llm import ConversationMemory
+from turbovec.llm.memory import RedisHistoryBackend
+
+mem = ConversationMemory(
+    backend=RedisHistoryBackend(url="redis://localhost:6379/0", ttl_seconds=3600),
+    embedder=OpenAIEmbedder(),  # optional — enables semantic recall
+)
+mem.append("user:42", {"role": "user", "content": "..."})
+recent = mem.history("user:42", last_n=20)
+relevant = mem.recall("user:42", query="earlier, we discussed auth — what did I decide?", k=5)
+```
+
 ## Rust
 
 ```bash

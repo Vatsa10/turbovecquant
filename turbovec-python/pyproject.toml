@@ -48,6 +48,14 @@ Issues = "https://github.com/RyanCodrai/turbovec/issues"
 [project.optional-dependencies]
 langchain = ["langchain-core>=0.3"]
 llama-index = ["llama-index-core>=0.11"]
+llm = ["numpy", "tiktoken"]
+llm-openai = ["openai>=1.0"]
+llm-anthropic = ["anthropic>=0.30"]
+llm-gemini = ["google-genai>=0.3"]
+llm-cohere = ["cohere>=5.0"]
+llm-voyage = ["voyageai>=0.2"]
+llm-local = ["sentence-transformers>=2.2"]
+llm-redis = ["redis>=5.0"]
 
 [tool.maturin]
 manifest-path = "Cargo.toml"
