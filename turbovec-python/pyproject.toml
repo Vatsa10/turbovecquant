@@ -58,6 +58,20 @@ llm-local = ["sentence-transformers>=2.2"]
 llm-redis = ["redis>=5.0"]
 llm-proxy = ["fastapi>=0.110", "uvicorn>=0.27"]
 llm-metrics = ["prometheus_client>=0.20"]
+llm-dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "python-dotenv>=1.0",
+    "httpx",
+]
+
+[tool.pytest.ini_options]
+# Live tests hit real provider APIs — excluded from the default run.
+# Run them explicitly with `pytest -m live`.
+addopts = "-m 'not live'"
+markers = [
+    "live: requires a live API key / provider",
+]
 
 [tool.maturin]
 manifest-path = "Cargo.toml"

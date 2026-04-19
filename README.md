@@ -263,6 +263,54 @@ Short-term history lives in the backend (in-memory dict or Redis list with TTL).
 
 Adding another provider is ~30 lines — implement `complete` / `stream` / `acomplete` / `astream` against the `LLM` protocol or `embed(texts)` against the `Embedder` protocol.
 
+## Testing
+
+Two-tier test suite — **run unit tests on every code change; run live tests only when you want to verify against real providers.**
+
+### Unit tests (fast, deterministic, default)
+
+Use fake embedders / LLMs and a locally-running Redis (Memurai on Windows) to cover the full control flow in < 20 s with no network calls or API costs.
+
+```bash
+pip install "turbovec[llm-dev,llm-redis,llm-proxy,llm-metrics]"
+python -m maturin build --release
+pip install --force-reinstall --no-deps target/wheels/turbovec-*.whl
+
+cd turbovec-python
+pytest                    # 59 tests, ~16 s — runs on every change
+```
+
+Covers: stores (in-memory / pickle / Redis with TTL expiry), semantic cache (hit/miss/persist/reload), gating (temperature, tool calls, force_cache), streaming (sync + async, cache-through), tenant scoping, invalidation, `$`-tracking, PII redaction, negative caching, retries (429/5xx backoff), LFU + TTL eviction, native tombstone deletion + slot reuse, RAG compression, conversation memory + semantic recall, the FastAPI proxy (streaming + tenant bearer hashing).
+
+### Live tests (opt-in, real providers)
+
+```bash
+cp .env.example .env      # at the repo root
+# fill in only the providers you want to exercise
+pytest -m live            # auto-skips when keys aren't set
+```
+
+`.env.example` lists every var the live suite recognises. Each test skips cleanly when its provider's key is missing — e.g., with only `OPENAI_API_KEY` set, the 4 OpenAI + 2 proxy tests run and the Anthropic / Gemini ones skip. Total cost of a full run with all keys present: under $0.001 (short prompts, `max_tokens=8-16`).
+
+What the live suite verifies:
+- `OpenAIEmbedder.embed()` returns L2-normalized vectors of the right shape.
+- `OpenAIChat / AnthropicChat / GeminiChat` `complete` + `stream` work against the real API with retries.
+- `SemanticCache.complete()` actually skips the upstream on a near-duplicate request (cost + hit-rate proof).
+- The FastAPI proxy answers `POST /v1/chat/completions` correctly against a real upstream.
+
+### Rust tests
+
+```bash
+cargo test --release       # 13 tests: 5 concurrent_search + 7 deletion + 1 doctest
+```
+
+### Do you need to run tests?
+
+- **After any code change**: yes — `pytest` (unit). Takes seconds. This is the safety net.
+- **After touching an LLM adapter** or before a release: run `pytest -m live` too.
+- **After touching the Rust core** (`turbovec/src/*`): `cargo test --release`, then rebuild the wheel and rerun `pytest`.
+- **Benchmarks (`benchmarks/suite/*.py`)**: not part of CI — only run when you want fresh recall / speed numbers for the README.
+
 ## Under the hood — turbovec
 
 Every feature above is backed by a single `TurboQuantIndex`. This is Google Research's [TurboQuant](https://arxiv.org/abs/2504.19874) quantizer (ICLR 2026), implemented as a Rust crate with Python bindings. Two things make it suitable for online, streaming workloads like an LLM cache:

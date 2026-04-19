@@ -11,3 +11,12 @@ target/
 evolve/
 evolve_rust/
 venv/
+
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# Local cache / test artifacts
+*.tv
+!docs/*.tv
