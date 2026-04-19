@@ -147,17 +147,30 @@ Each `Metrics()` instance owns its own `CollectorRegistry` so multiple caches in
 
 ### Eviction
 
-The `TurboQuantIndex` itself is append-only, so eviction happens at the payload store. Run these periodically (they're not in the hot path):
+`TurboQuantIndex` supports native tombstone deletion with slot reuse, so evicted entries reclaim their slots on the next `add` — no periodic `compact()` needed. `cache.invalidate(...)` routes through `TurboQuantIndex.delete`, and `SemanticCache` auto-tombstones any slot whose payload has been evicted out from under it (e.g., by Redis TTL):
 
 ```python
-from turbovec.llm.eviction import lfu_evict, ttl_evict
+cache.invalidate(tenant="org:acme")               # delete + free slots for reuse
+cache.invalidate(older_than_seconds=86400)
 
-lfu_evict(cache.store, max_entries=100_000)       # drop coldest by hit-counter
-ttl_evict(cache.store, max_age_seconds=7*86400)   # drop entries older than a week
-cache.compact()                                    # rebuild the index after mass eviction
+from turbovec.llm.eviction import lfu_evict, ttl_evict
+lfu_evict(cache.store, max_entries=100_000)       # drop coldest payload entries
+ttl_evict(cache.store, max_age_seconds=7*86400)   # drop payloads older than a week
+cache.compact()                                    # optional — defragment after mass eviction
 ```
 
-With Redis, `ttl_seconds` on the store gives you native TTL + LRU for free; `lfu_evict` covers backends that don't.
+With Redis, `ttl_seconds` on the store gives native TTL + LRU; slots freed by eviction are automatically tombstoned on the next lookup that hits an empty payload.
+
+Raw index primitives (use when managing the index directly):
+
+```python
+index.delete([0, 5, 12])   # tombstone; slots reused by next add()
+index.is_deleted(5)        # -> True
+index.num_deleted()        # tombstone count
+index.capacity()           # physical slot count (incl. tombstones)
+len(index)                 # live count
+new_ids = index.add(vecs)  # returns slot ids (reused slots first, LIFO)
+```
 
 ## OpenAI-compatible proxy
 
@@ -276,17 +289,20 @@ Full benchmarks vs FAISS IndexPQFastScan are in `benchmarks/results/`; see [the 
 pip install maturin
 cd turbovec-python
 maturin build --release
-pip install target/wheels/*.whl
+pip install target/wheels/*.whl 
+or
+pip install ../target/wheels/turbovec-0.2.0-cp39-abi3-win_amd64.whl
 ```
 
 All x86_64 builds target `x86-64-v3` (AVX2 baseline, Haswell 2013+) via `.cargo/config.toml`. Any CPU that runs the AVX2 fallback kernel runs the whole crate — the AVX-512 kernel is gated at runtime via `is_x86_feature_detected!`.
 
 ## Roadmap
 
-- **QJL residual (Rust).** TurboQuant's second stage — a 1-bit Quantized Johnson-Lindenstrauss transform applied to the residual of the MSE-optimal quantizer — gives *unbiased* inner-product estimation at the same bit budget. This improves 2-bit recall for semantic matching and isn't yet ported to the Rust core.
+- **~~Native deletion with slot reuse.~~ Done.** Rust `TurboQuantIndex.delete(ids)` tombstones slots, the next `add` reuses them in LIFO order, and the `.tv` file format persists tombstones via an optional post-norms section (legacy files still load). `SemanticCache.invalidate()` now routes through this and stale Redis payloads auto-tombstone on detection — no compaction job required.
 - **Batch + prefix cache.** Multi-turn conversations share long system + history prefixes; caching common prefixes separately from the user tail could push hit rates higher on agent workloads.
 - **Streaming rerank.** Over-retrieve from the quantized index, then rerank top-k with a cross-encoder before packing into the token budget.
 - **Semantic routing.** Use the index to classify queries and route easy ones to a cheaper model. The quantization already makes the classifier free.
+- **QJL residual (explicitly out of scope).** The paper's 1-bit QJL residual gives unbiased inner-product estimation — useful inside attention softmax, not for threshold-based cache lookup. Switching to 3-bit Lloyd-Max is a simpler path to any recall improvement this use case needs.
 
 ## References
 

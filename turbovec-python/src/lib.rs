@@ -16,10 +16,16 @@ impl TurboQuantIndex {
         }
     }
 
-    fn add(&mut self, vectors: PyReadonlyArray2<f32>) {
+    /// Add vectors to the index.
+    ///
+    /// Returns the slot ids (length == number of input vectors) so
+    /// callers can key external metadata on the exact slot that was
+    /// written. Slots freed by `delete()` are reused in LIFO order;
+    /// the remainder is appended.
+    fn add(&mut self, vectors: PyReadonlyArray2<f32>) -> Vec<i64> {
         let arr = vectors.as_array();
         let slice = arr.as_slice().expect("vectors must be contiguous");
-        self.inner.add(slice);
+        self.inner.add(slice)
     }
 
     fn search<'py>(
@@ -62,6 +68,28 @@ impl TurboQuantIndex {
     /// the one-time initialisation cost.
     fn prepare(&self) {
         self.inner.prepare();
+    }
+
+    /// Tombstone one or more vector ids. Deleted ids are excluded from
+    /// subsequent search results and their slots become available for
+    /// reuse by the next `add`. Ids outside `[0, capacity())` and
+    /// already-deleted ids are silently ignored.
+    fn delete(&mut self, ids: Vec<i64>) {
+        self.inner.delete(&ids);
+    }
+
+    fn is_deleted(&self, id: i64) -> bool {
+        self.inner.is_deleted(id)
+    }
+
+    fn num_deleted(&self) -> usize {
+        self.inner.num_deleted()
+    }
+
+    /// Physical slot count — includes tombstoned slots. Use `len()`
+    /// for the live count.
+    fn capacity(&self) -> usize {
+        self.inner.capacity()
     }
 
     fn __len__(&self) -> usize {

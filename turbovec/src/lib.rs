@@ -65,6 +65,13 @@ pub struct TurboQuantIndex {
     packed_codes: Vec<u8>,
     norms: Vec<f32>,
 
+    // Tombstones: one byte per slot, 1 = deleted. Parallel to `norms`,
+    // always resized in lockstep with `n_vectors`. `free_list` lets
+    // `add` reuse a previously-deleted slot instead of appending.
+    tombstones: Vec<u8>,
+    free_list: Vec<usize>,
+    num_deleted: usize,
+
     // Thread-safe lazy caches. These are initialised from `&self` via
     // `OnceLock::get_or_init`, which allows `search` to take `&self`
     // and run concurrently from multiple threads without external
@@ -108,19 +115,36 @@ impl TurboQuantIndex {
             n_vectors: 0,
             packed_codes: Vec::new(),
             norms: Vec::new(),
+            tombstones: Vec::new(),
+            free_list: Vec::new(),
+            num_deleted: 0,
             rotation: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
         }
     }
 
-    pub fn add(&mut self, vectors: &[f32]) {
+    #[inline]
+    fn bytes_per_vector(&self) -> usize {
+        (self.dim / 8) * self.bit_width
+    }
+
+    /// Add vectors and return the slot ids they were written to.
+    ///
+    /// Slots previously freed by [`TurboQuantIndex::delete`] are reused
+    /// in LIFO order; any remainder is appended. The returned vector
+    /// has length equal to the number of input vectors and is in
+    /// input order, so callers can pair each input with its slot id.
+    pub fn add(&mut self, vectors: &[f32]) -> Vec<i64> {
         let n = vectors.len() / self.dim;
         assert_eq!(
             vectors.len(),
             n * self.dim,
             "vectors length must be a multiple of dim"
         );
+        if n == 0 {
+            return Vec::new();
+        }
 
         let rotation = self
             .rotation
@@ -129,20 +153,97 @@ impl TurboQuantIndex {
         let (packed, norms) =
             encode::encode(vectors, n, self.dim, rotation, &boundaries, self.bit_width);
 
-        if self.n_vectors == 0 {
-            self.packed_codes = packed;
-            self.norms = norms;
-        } else {
-            self.packed_codes.extend_from_slice(&packed);
-            self.norms.extend_from_slice(&norms);
+        let bpv = self.bytes_per_vector();
+        let mut slots = Vec::with_capacity(n);
+        let mut i = 0;
+
+        // Reuse deleted slots first. Writing into `packed_codes` directly
+        // is safe because the per-vector layout is contiguous: slot `s`
+        // owns bytes `s * bpv .. (s + 1) * bpv`.
+        while i < n {
+            let Some(slot) = self.free_list.pop() else {
+                break;
+            };
+            let src = i * bpv;
+            let dst = slot * bpv;
+            self.packed_codes[dst..dst + bpv].copy_from_slice(&packed[src..src + bpv]);
+            self.norms[slot] = norms[i];
+            self.tombstones[slot] = 0;
+            self.num_deleted -= 1;
+            slots.push(slot as i64);
+            i += 1;
         }
-        self.n_vectors += n;
+
+        // Append whatever did not fit into a reused slot.
+        if i < n {
+            let rem = n - i;
+            self.packed_codes.extend_from_slice(&packed[i * bpv..]);
+            self.norms.extend_from_slice(&norms[i..]);
+            self.tombstones.extend(std::iter::repeat(0u8).take(rem));
+            for j in 0..rem {
+                slots.push((self.n_vectors + j) as i64);
+            }
+            self.n_vectors += rem;
+        }
 
         // Invalidate the blocked cache — it was derived from the old
-        // `packed_codes` and no longer matches the extended vector set.
-        // Rotation and centroids remain valid (they only depend on
-        // `(dim, ROTATION_SEED)` and `(bit_width, dim)`).
+        // `packed_codes` and no longer matches the new contents.
         self.blocked = OnceLock::new();
+        slots
+    }
+
+    /// Mark one or more vectors as deleted.
+    ///
+    /// Deleted vectors are excluded from subsequent `search` results and
+    /// their slots become available for reuse on the next `add`. This is
+    /// a tombstone-based delete — storage is not compacted in place, so
+    /// the on-disk and in-memory footprint is unchanged until slots are
+    /// reused.
+    ///
+    /// Ids outside `[0, len())` and already-deleted ids are silently
+    /// ignored, mirroring the convention that deletion is idempotent.
+    pub fn delete(&mut self, ids: &[i64]) {
+        for &id in ids {
+            if id < 0 {
+                continue;
+            }
+            let uid = id as usize;
+            if uid >= self.n_vectors {
+                continue;
+            }
+            if self.tombstones[uid] != 0 {
+                continue;
+            }
+            self.tombstones[uid] = 1;
+            self.free_list.push(uid);
+            self.num_deleted += 1;
+        }
+        // Invalidate blocked cache so next search rebuilds (we don't
+        // strictly need to — the SIMD scan still scores deleted slots —
+        // but it keeps invariants simple and is cheap on next use).
+        self.blocked = OnceLock::new();
+    }
+
+    pub fn is_deleted(&self, id: i64) -> bool {
+        if id < 0 {
+            return false;
+        }
+        let uid = id as usize;
+        uid < self.n_vectors && self.tombstones[uid] != 0
+    }
+
+    pub fn num_deleted(&self) -> usize {
+        self.num_deleted
+    }
+
+    /// Live vector count — excludes tombstoned slots.
+    pub fn live_count(&self) -> usize {
+        self.n_vectors - self.num_deleted
+    }
+
+    /// Physical slot capacity — including tombstoned slots.
+    pub fn capacity(&self) -> usize {
+        self.n_vectors
     }
 
     /// Run a top-`k` search against the index.
@@ -173,9 +274,24 @@ impl TurboQuantIndex {
             BlockedCache { data, n_blocks }
         });
 
-        let k = k.min(self.n_vectors);
+        let live = self.n_vectors - self.num_deleted;
+        let k = k.min(live);
 
-        let (scores, indices) = search::search(
+        // Over-fetch by `num_deleted` so that after dropping tombstoned
+        // ids we still have at least `k` live results. When no vectors
+        // are deleted this degenerates to the existing fast path.
+        let k_search = (k + self.num_deleted).min(self.n_vectors);
+
+        if k_search == 0 {
+            return SearchResults {
+                scores: vec![0.0; nq * k],
+                indices: vec![-1; nq * k],
+                nq,
+                k,
+            };
+        }
+
+        let (raw_scores, raw_indices) = search::search(
             queries,
             nq,
             rotation,
@@ -186,8 +302,49 @@ impl TurboQuantIndex {
             self.dim,
             self.n_vectors,
             blocked.n_blocks,
-            k,
+            k_search,
         );
+
+        if self.num_deleted == 0 {
+            return SearchResults {
+                scores: raw_scores,
+                indices: raw_indices,
+                nq,
+                k,
+            };
+        }
+
+        // Filter tombstones out of each query's top-k_search list,
+        // keeping the first `k` live ids. Results arrive sorted best-to-
+        // -worst so we just scan linearly.
+        let mut scores = Vec::with_capacity(nq * k);
+        let mut indices = Vec::with_capacity(nq * k);
+        for qi in 0..nq {
+            let row_start = qi * k_search;
+            let row_end = row_start + k_search;
+            let row_s = &raw_scores[row_start..row_end];
+            let row_i = &raw_indices[row_start..row_end];
+            let mut kept = 0;
+            for (&s, &idx) in row_s.iter().zip(row_i.iter()) {
+                if kept == k {
+                    break;
+                }
+                if idx < 0 {
+                    continue;
+                }
+                let uidx = idx as usize;
+                if uidx < self.tombstones.len() && self.tombstones[uidx] == 0 {
+                    scores.push(s);
+                    indices.push(idx);
+                    kept += 1;
+                }
+            }
+            while kept < k {
+                scores.push(0.0);
+                indices.push(-1);
+                kept += 1;
+            }
+        }
 
         SearchResults {
             scores,
@@ -228,29 +385,43 @@ impl TurboQuantIndex {
             self.n_vectors,
             &self.packed_codes,
             &self.norms,
+            &self.tombstones,
         )
     }
 
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let (bit_width, dim, n_vectors, packed_codes, norms) = io::load(path)?;
+        let (bit_width, dim, n_vectors, packed_codes, norms, tombstones) = io::load(path)?;
+        let mut free_list = Vec::new();
+        let mut num_deleted = 0usize;
+        for (i, &t) in tombstones.iter().enumerate() {
+            if t != 0 {
+                free_list.push(i);
+                num_deleted += 1;
+            }
+        }
         Ok(Self {
             dim,
             bit_width,
             n_vectors,
             packed_codes,
             norms,
+            tombstones,
+            free_list,
+            num_deleted,
             rotation: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
         })
     }
 
+    /// Live vector count — excludes tombstoned slots. This is the
+    /// user-visible length (matches Python `len(index)`).
     pub fn len(&self) -> usize {
-        self.n_vectors
+        self.n_vectors - self.num_deleted
     }
 
     pub fn is_empty(&self) -> bool {
-        self.n_vectors == 0
+        self.len() == 0
     }
 
     pub fn dim(&self) -> usize {

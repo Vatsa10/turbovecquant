@@ -126,7 +126,11 @@ class SemanticCache:
         self._tokens_saved_in = 0
         self._tokens_saved_out = 0
         self._dollars_saved = 0.0
-        self._dead_ids: set[int] = set()
+        # Native tombstones in the Rust index handle deletion; Python-
+        # side bookkeeping is only needed for stale payload detection
+        # after a store-level TTL eviction (store miss on an index hit
+        # that isn't yet reflected in the index).
+        self._pending_dead: set[int] = set()
 
     # ---------------------------------------------------------- public props
     @property
@@ -321,13 +325,16 @@ class SemanticCache:
         scores, indices = self._index.search(qvec, k)
         for score, idx in zip(scores[0], indices[0]):
             idx_i = int(idx)
-            if idx_i in self._dead_ids:
+            if idx_i < 0:
                 continue
             if float(score) < self._threshold:
                 return None
             entry = self._store.get(idx_i)
             if entry is None:
-                self._dead_ids.add(idx_i)
+                # Payload was evicted (e.g., Redis TTL) but the vector is
+                # still live in the index — tombstone it so the slot can
+                # be reused on the next miss.
+                self._index.delete([idx_i])
                 continue
             if entry.get("system_fp") != sys_fp:
                 continue
@@ -337,7 +344,7 @@ class SemanticCache:
                 expires = float(entry.get("expires_at", 0))
                 if expires and time.time() > expires:
                     self._store.delete(idx_i)
-                    self._dead_ids.add(idx_i)
+                    self._index.delete([idx_i])
                     continue
                 raise RuntimeError(f"negative-cached upstream error: {entry.get('error', 'unknown')}")
             self._store.incr_hits(idx_i)
@@ -360,9 +367,15 @@ class SemanticCache:
         expires_at: float = 0.0,
         error: str = "",
     ) -> int:
-        new_id = len(self._index)
-        self._index.add(qvec)
+        # `index.add` returns the slot ids it wrote to. With native
+        # tombstones this might be a reused slot rather than a new one
+        # at the tail, so we cannot use `len(index)` as the key.
+        new_ids = self._index.add(qvec)
+        new_id = int(new_ids[0])
         prompt_hash = hashlib.sha256(key_text.encode("utf-8")).hexdigest()[:16]
+        # If this slot previously held an entry (payload evicted,
+        # tombstone reused), clear any stale payload under the same id.
+        self._store.delete(new_id)
         self._store.set(
             new_id,
             {
@@ -440,6 +453,8 @@ class SemanticCache:
     # ---------------------------------------------------------- admin API
     def stats(self) -> dict[str, Any]:
         total = self._hits + self._misses
+        num_deleted = getattr(self._index, "num_deleted", lambda: 0)()
+        capacity = getattr(self._index, "capacity", lambda: len(self._index))()
         return {
             "hits": self._hits,
             "misses": self._misses,
@@ -451,8 +466,9 @@ class SemanticCache:
             "tokens_saved": self._tokens_saved_in + self._tokens_saved_out,
             "dollars_saved": round(self._dollars_saved, 6),
             "entries": len(self._store),
-            "index_size": len(self._index),
-            "dead_slots": len(self._dead_ids),
+            "index_live": len(self._index),
+            "index_capacity": capacity,
+            "tombstones": num_deleted,
         }
 
     def invalidate(
@@ -462,9 +478,14 @@ class SemanticCache:
         older_than_seconds: Optional[float] = None,
         predicate: Optional[Callable[[dict], bool]] = None,
     ) -> int:
-        """Delete matching entries. Returns the number of entries removed."""
+        """Delete matching entries. Returns the number of entries removed.
+
+        This calls native `TurboQuantIndex.delete` on each matching slot,
+        so the id becomes available for reuse on the next insert — no
+        `compact()` call is needed.
+        """
         now = time.time()
-        removed = 0
+        victims: list[int] = []
         for k in list(self._store.keys()):
             e = self._store.get(k)
             if e is None:
@@ -476,9 +497,10 @@ class SemanticCache:
             if predicate is not None and not predicate(e):
                 continue
             self._store.delete(k)
-            self._dead_ids.add(k)
-            removed += 1
-        return removed
+            victims.append(k)
+        if victims:
+            self._index.delete(victims)
+        return len(victims)
 
     def save(self) -> None:
         if self._path is None:
@@ -489,10 +511,19 @@ class SemanticCache:
             self._store.save()
 
     def compact(self) -> None:
-        """Rebuild the index from live store entries, dropping dead slots."""
-        live_ids = [i for i in self._store.keys() if i not in self._dead_ids]
-        live_entries = [(i, self._store.get(i)) for i in live_ids]
-        live_entries = [(i, e) for i, e in live_entries if e is not None and e.get("kind") != "error"]
+        """Rebuild the index from live store entries from scratch.
+
+        Native tombstones + free-list reuse make this largely optional —
+        slots are reclaimed as new entries arrive. Call ``compact()``
+        when you want a defragmented index (e.g., after dropping a huge
+        tenant) or to drop ``kind == "error"`` negative-cache entries.
+        """
+        live_entries = []
+        for k in self._store.keys():
+            e = self._store.get(k)
+            if e is not None and e.get("kind") != "error":
+                live_entries.append(e)
+
         dim = self._index.dim
         bit_width = self._index.bit_width
         new_index = TurboQuantIndex(dim, bit_width)
@@ -503,14 +534,15 @@ class SemanticCache:
             new_store = self._store
             for i in list(self._store.keys()):
                 self._store.delete(i)
-        for new_id, (_old_id, entry) in enumerate(live_entries):
+
+        for entry in live_entries:
             key_text = self._key_fn(entry["messages"])
             vec = self._embedder.embed([self._redact(key_text)])
-            new_index.add(vec)
-            new_store.set(new_id, entry)
+            new_ids = new_index.add(vec)
+            new_store.set(int(new_ids[0]), entry)
+
         self._index = new_index
         self._store = new_store
-        self._dead_ids.clear()
 
 
 __all__ = ["SemanticCache"]
